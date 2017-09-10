@@ -185,7 +185,7 @@ public:
    */
   void toneMutesScore(boolean mute);
 
-private:
+//private:
   void static playNote(byte chan, byte note);
   void static stopNote(byte chan);
 

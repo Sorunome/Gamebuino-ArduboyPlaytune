@@ -45,6 +45,7 @@
 *****************************************************************************/
 
 #include "Gamebuino-ArduboyPlaytune.h"
+#include <Gamebuino-Meta.h>
 
 
 static const byte tune_pin_to_timer[] = { 3, 1 };
@@ -91,6 +92,34 @@ const unsigned int _midi_word_note_frequencies[80] PROGMEM = {
 22351,23680,25088
 };
 
+void gb_updateTones();
+
+class GB_Sound_Handler_Playtune;
+
+Gamebuino_Meta::Sound_Channel* gb_channel[2];
+GB_Sound_Handler_Playtune* gb_handler[2] = {0, 0};
+
+class GB_Sound_Handler_Playtune : public Gamebuino_Meta::Sound_Handler {
+public:
+  int8_t i = -1;
+  GB_Sound_Handler_Playtune(uint8_t _i) : Gamebuino_Meta::Sound_Handler(0) {
+    i = _i;
+  };
+  ~GB_Sound_Handler_Playtune() {
+    gb_channel[i] = 0;
+    gb_handler[i] = 0;
+  };
+  void update() {
+    gb_updateTones();
+  }
+  void rewind() {
+    // do nothing, this is a dummy
+  }
+  void escapeChannel() {
+    gb_channel[i] = channel;
+  }
+};
+
 ArduboyPlaytune::ArduboyPlaytune(boolean (*outEn)())
 {
   outputEnabled = outEn;
@@ -98,32 +127,84 @@ ArduboyPlaytune::ArduboyPlaytune(boolean (*outEn)())
 
 void ArduboyPlaytune::initChannel(byte pin)
 {
-  // trash
+  // trash, we already initialized stuff in gb.begin()
+  _tune_num_chans = 2; // we only need to do this, lol
+  tone_only = true; // so we don't do scores on channel 1, it seems
 }
 
 void ArduboyPlaytune::playNote(byte chan, byte note)
 {
-  // trash
+  byte timer_num;
+  byte prescalar_bits;
+  unsigned int frequency2; /* frequency times 2 */
+  unsigned long ocr;
+
+  // we can't play on a channel that does not exist
+  if (chan >= _tune_num_chans) {
+    return;
+  }
+
+  // if channel 1 is for tones only
+  if ((chan == 1) && tone_only) {
+    return;
+  }
+
+  // we only have frequencies for 128 notes
+  if (note > 127) {
+    return;
+  }
+  
+  if (note < 48) {
+    frequency2 = pgm_read_byte(_midi_byte_note_frequencies + note);
+  } else {
+    frequency2 = pgm_read_word(_midi_word_note_frequencies + note - 48);
+  }
+  
+  if (!gb_channel[chan]) {
+    gb_handler[chan] = new GB_Sound_Handler_Playtune(chan);
+    gb.sound.play(gb_handler[chan], true);
+    gb_handler[chan]->escapeChannel();
+  }
+  
+  if (!gb_channel[chan]) {
+    delete gb_handler[chan];
+    gb_handler[chan] = 0;
+    return;
+  }
+  
+  gb_channel[chan]->type = Gamebuino_Meta::Sound_Channel_Type::pattern;
+  gb_channel[chan]->total = 44100 / frequency2;
+  gb_channel[chan]->index = 0;
+  gb_channel[chan]->amplitude = 0x30;
+  
+  gb_channel[chan]->use = true;
 }
 
 void ArduboyPlaytune::stopNote(byte chan)
 {
-  // trash
+  if (gb_channel[chan]) {
+    gb_channel[chan]->use = false;
+  }
 }
 
 void ArduboyPlaytune::playScore(const byte *score)
 {
-  // trash
+  score_start = score;
+  score_cursor = score_start;
+  step();  /* execute initial commands */
+  tune_playing = true; /* release the interrupt routine */
 }
 
 void ArduboyPlaytune::stopScore()
 {
-  // trash
+  for (uint8_t i = 0; i < _tune_num_chans; i++)
+    stopNote(i);
+  tune_playing = false;
 }
 
 boolean ArduboyPlaytune::playing()
 {
-  return false; // trash
+  return tune_playing;
 }
 
 /* Do score commands until a "wait" is found, or the score is stopped.
@@ -133,22 +214,122 @@ from the interrupt routine when waits expire.
 If CMD < 0x80, then the other 7 bits and the next byte are a
 15-bit big-endian number of msec to wait
 */
+int32_t gb_score_duration = 0;
 void ArduboyPlaytune::step()
 {
-  // trash
+  byte command, opcode, chan;
+  unsigned duration;
+  
+  while (1) {
+    command = pgm_read_byte(score_cursor++);
+    opcode = command & 0xf0;
+    chan = command & 0x0f;
+    if (opcode == TUNE_OP_STOPNOTE) { /* stop note */
+      stopNote(chan);
+    }
+    else if (opcode == TUNE_OP_PLAYNOTE) { /* play note */
+      all_muted = !outputEnabled();
+      playNote(chan, pgm_read_byte(score_cursor++));
+    }
+    else if (opcode < 0x80) { /* wait count in msec. */
+      duration = ((unsigned)command << 8) | (pgm_read_byte(score_cursor++));
+      wait_toggle_count = ((unsigned long) wait_timer_frequency2 * duration + 500) / 1000;
+      if (wait_toggle_count == 0) wait_toggle_count = 1;
+      gb_score_duration = wait_toggle_count;
+      break;
+    }
+    else if (opcode == TUNE_OP_RESTART) { /* restart score */
+      score_cursor = score_start;
+    }
+    else if (opcode == TUNE_OP_STOP) { /* stop score */
+      tune_playing = false;
+      break;
+    }
+  }
 }
 
 void ArduboyPlaytune::closeChannels()
 {
-  // trash
+  for (uint8_t i = 0; i < _tune_num_chans; i++)
+    stopNote(i);
+  _tune_num_chans = 0;
+  tune_playing = tone_playing = tone_only = mute_score = false;
 }
 
+int32_t gb_tone_duration;
 void ArduboyPlaytune::tone(unsigned int frequency, unsigned long duration)
 {
-  // trash
+  if (!outputEnabled() || _tune_num_chans < 2) {
+    return;
+  }
+  
+  tone_playing = true;
+  mute_score = tone_mutes_score;
+  
+  if (!gb_channel[1]) {
+    gb_handler[1] = new GB_Sound_Handler_Playtune(1);
+    gb.sound.play(gb_handler[1], true);
+    gb_handler[1]->escapeChannel();
+  }
+  
+  if (!gb_channel[1]) {
+    delete gb_handler[1];
+    gb_handler[1] = 0;
+    return;
+  }
+  
+  gb_channel[1]->type = Gamebuino_Meta::Sound_Channel_Type::pattern;
+  gb_channel[1]->total = 22050 / frequency;
+  gb_channel[1]->index = 0;
+  gb_channel[1]->amplitude = 0x30;
+  
+  gb_channel[1]->use = true;
+  gb_tone_duration = duration;
 }
 
 void ArduboyPlaytune::toneMutesScore(boolean mute)
 {
-  // trash
+  tone_mutes_score = mute;
+}
+
+uint32_t lastFrameUpdate = 0;
+
+void gb_updateTones() {
+  if (lastFrameUpdate == gb.frameCount) {
+    return;
+  }
+  lastFrameUpdate = gb.frameCount;
+  
+  for (uint8_t i = 0; i < _tune_num_chans; i++) {
+    if (!gb_channel[i]) {
+      ArduboyPlaytune::stopNote(i);
+      continue;
+    }
+  }
+  
+  // tone update
+  if (tone_playing) {
+    gb_tone_duration -= gb.getTimePerFrame();
+    if (gb_tone_duration <= 0) {
+      if (gb_channel[1]) {
+        gb_channel[1]->use = false;
+      }
+      tone_playing = mute_score = false;
+    }
+  }
+  
+  // score update
+  if (tune_playing) {
+    gb_score_duration -= gb.getTimePerFrame();
+    if (gb_score_duration <= 0) {
+      ArduboyPlaytune::step();
+    }
+  }
+  
+  if (mute_score || all_muted) {
+    ArduboyPlaytune::stopNote(0);
+  }
+  if (all_muted) {
+    ArduboyPlaytune::stopNote(1);
+  }
 }
