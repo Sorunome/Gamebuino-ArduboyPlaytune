@@ -172,7 +172,7 @@ void ArduboyPlaytune::playNote(byte chan, byte note)
     return;
   }
   
-  gb_channel[chan]->type = Gamebuino_Meta::Sound_Channel_Type::pattern;
+  gb_channel[chan]->type = Gamebuino_Meta::Sound_Channel_Type::square;
   gb_channel[chan]->total = 44100 / frequency2;
   gb_channel[chan]->index = 0;
   gb_channel[chan]->amplitude = 0x30;
@@ -278,7 +278,7 @@ void ArduboyPlaytune::tone(unsigned int frequency, unsigned long duration)
     return;
   }
   
-  gb_channel[1]->type = Gamebuino_Meta::Sound_Channel_Type::pattern;
+  gb_channel[1]->type = Gamebuino_Meta::Sound_Channel_Type::square;
   gb_channel[1]->total = 22050 / frequency;
   gb_channel[1]->index = 0;
   gb_channel[1]->amplitude = 0x30;
